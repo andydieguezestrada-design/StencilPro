@@ -287,8 +287,8 @@ object ImageProcessor {
         var tail = 0
         for (i in nms.indices) {
             when {
-                nms[i] >= high -> { state[i] = 2; queue[tail++] = i }
-                nms[i] >= low -> state[i] = 1
+                nms[i] >= high -> { state[i] = 2.toByte(); queue[tail++] = i }
+                nms[i] >= low -> state[i] = 1.toByte()
             }
         }
         val result = BooleanArray(w * h)
@@ -303,8 +303,8 @@ object ImageProcessor {
                 val ny = y + dy
                 if (nx !in 1 until w - 1 || ny !in 1 until h - 1) continue
                 val ni = ny * w + nx
-                if (state[ni] == 1) {
-                    state[ni] = 2
+                if (state[ni] == 1.toByte()) {
+                    state[ni] = 2.toByte()
                     queue[tail++] = ni
                 }
             }
