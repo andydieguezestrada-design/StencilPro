@@ -3,9 +3,9 @@ package com.tattoostencil.pro.processing
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
-import com.microsoft.onnxruntime.OnnxTensor
-import com.microsoft.onnxruntime.OrtEnvironment
-import com.microsoft.onnxruntime.OrtSession
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -16,6 +16,7 @@ import java.nio.FloatBuffer
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 /**
  * StencilPro image engine.
@@ -112,7 +113,7 @@ object ImageProcessor {
         if (!model.isReady()) return professionalStencilMask(bitmap, s)
         return try {
             val raw = model.infer(bitmap, s.aiInputSize, enhance = true)
-            val resized = resizeMask(raw.first, raw.second, bitmap.width, bitmap.height)
+            val resized = resizeMask(raw.first, raw.second.first, raw.second.second, bitmap.width, bitmap.height)
             // AI output is combined with a conservative structural pass. This prevents
             // the model from turning photographic micro-texture into tattoo marks.
             val structure = professionalStencilMask(bitmap, s.copy(edgeStrength = (s.edgeStrength + 8).coerceAtMost(90)))
@@ -275,16 +276,25 @@ private class AiLineartEngine private constructor(private val context: Context) 
             download(DRAW_URL,d);download(RELIEF_URL,r)
         }
         if(!d.exists()||!r.exists())return false
-        return runCatching{env=OrtEnvironment.getEnvironment();val opts=OrtSession.SessionOptions();opts.setIntraOpNumThreads(4);draw=env!!.createSession(d.absolutePath,opts);relief=env!!.createSession(r.absolutePath,opts);true}.getOrDefault(false)
+        return runCatching {
+            val environment = OrtEnvironment.getEnvironment()
+            env = environment
+            val opts = OrtSession.SessionOptions()
+            opts.setIntraOpNumThreads(4)
+            draw = environment.createSession(d.absolutePath, opts)
+            relief = environment.createSession(r.absolutePath, opts)
+            true
+        }.getOrDefault(false)
     }
 
     fun infer(bitmap:Bitmap,size:Int,enhance:Boolean):Pair<BooleanArray,Pair<Int,Int>>{
         val d=draw?:error("AI model unavailable");val r=relief?:error("AI model unavailable");val input=letterbox(bitmap,size)
         val data=FloatArray(size*size*3);val px=IntArray(size*size);input.getPixels(px,0,size,0,0,size,size)
         var k=0;for(c in 0..2)for(i in px.indices){val p=px[i];data[k++]=when(c){0->Color.red(p);1->Color.green(p);else->Color.blue(p)}/255f}
-        val tensor=OnnxTensor.createTensor(env,FloatBuffer.wrap(data),longArrayOf(1,3,size.toLong(),size.toLong()))
+        val environment = env ?: error("ONNX environment unavailable")
+        val tensor=OnnxTensor.createTensor(environment,FloatBuffer.wrap(data),longArrayOf(1,3,size.toLong(),size.toLong()))
         val res=d.run(mapOf(d.inputNames.first() to tensor));val t=res[0] as OnnxTensor;val fb=t.floatBuffer;val n=size*size;val raw=FloatArray(n);fb.get(raw,0,n);tensor.close();res.close()
-        val enhanced=if(enhance){val nhwc=FloatArray(n);for(i in 0 until n)nhwc[i]=raw[i]*2f-1f;val rt=OnnxTensor.createTensor(env,FloatBuffer.wrap(nhwc),longArrayOf(1,size.toLong(),size.toLong(),1));val rr=r.run(mapOf(r.inputNames.first() to rt));val ot=rr[0] as OnnxTensor;val of=ot.floatBuffer;val arr=FloatArray(n);of.get(arr,0,n);ot.close();rr.close();rt.close();arr}else raw
+        val enhanced=if(enhance){val nhwc=FloatArray(n);for(i in 0 until n)nhwc[i]=raw[i]*2f-1f;val rt=OnnxTensor.createTensor(environment,FloatBuffer.wrap(nhwc),longArrayOf(1,size.toLong(),size.toLong(),1));val rr=r.run(mapOf(r.inputNames.first() to rt));val ot=rr[0] as OnnxTensor;val of=ot.floatBuffer;val arr=FloatArray(n);of.get(arr,0,n);ot.close();rr.close();rt.close();arr}else raw
         val minV=enhanced.minOrNull()?:0f;val maxV=enhanced.maxOrNull()?:1f;val span=(maxV-minV).takeIf{it>1e-6f}?:1f
         val mask=BooleanArray(n){((enhanced[it]-minV)/span)<0.46f}
         input.recycle()
