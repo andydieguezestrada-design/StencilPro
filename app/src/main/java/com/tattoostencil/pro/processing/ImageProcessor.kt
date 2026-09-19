@@ -37,7 +37,7 @@ object ImageProcessor {
         val edgeStrength: Int = 62,
         val invertColors: Boolean = false,
         val smoothEdges: Boolean = true,
-        val lineWidth: Int = 2,
+        val lineWidth: Int = 1,
         val removeNoise: Boolean = true,
         val preserveDetail: Boolean = true,
         val backgroundWhite: Boolean = true,
@@ -58,7 +58,7 @@ object ImageProcessor {
         val width = gray.width
         val height = gray.height
         val mask = when (filterType) {
-            FilterType.CLEAN_LINES -> cleanLinesMask(gray, settings)
+            FilterType.CLEAN_LINES -> professionalStencilMask(gray, settings)
             FilterType.FINE_DETAIL -> fineDetailMask(gray, settings)
             FilterType.THRESHOLD -> thresholdMask(gray, settings.threshold)
             FilterType.SKETCH -> sketchMask(gray, settings)
@@ -69,7 +69,7 @@ object ImageProcessor {
         var finalMask = mask
         if (settings.removeNoise && filterType != FilterType.THRESHOLD && filterType != FilterType.HIGH_CONTRAST) {
             finalMask = removeSmallComponents(finalMask, width, height, settings.preserveDetail)
-            finalMask = cleanMask(finalMask, width, height, if (settings.preserveDetail) 2 else 3)
+            finalMask = cleanMask(finalMask, width, height, if (filterType == FilterType.CLEAN_LINES) 3 else if (settings.preserveDetail) 2 else 3)
         }
         if (settings.lineWidth > 1 && filterType != FilterType.THRESHOLD && filterType != FilterType.HIGH_CONTRAST) {
             finalMask = thicken(finalMask, width, height, settings.lineWidth - 1)
@@ -86,7 +86,7 @@ object ImageProcessor {
         return if (analysisOut.width == outputSource.width && analysisOut.height == outputSource.height) {
             analysisOut
         } else {
-            Bitmap.createScaledBitmap(analysisOut, outputSource.width, outputSource.height, true).also {
+            Bitmap.createScaledBitmap(analysisOut, outputSource.width, outputSource.height, false).also {
                 analysisOut.recycle()
             }
         }
@@ -165,11 +165,46 @@ object ImageProcessor {
         return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { it.setPixels(dst, 0, w, 0, 0, w, h) }
     }
 
-    /** Main professional-style path: suppress texture, then extract stable structural edges. */
+    /**
+     * Professional stencil path. A single Canny pass is too sensitive to photographic
+     * texture. We therefore extract a stable coarse structure first, then allow only
+     * stronger fine edges that sit close to that structure. This deliberately favours
+     * continuous tattoo-readable contours over photographic micro-texture.
+     */
+    private fun professionalStencilMask(bitmap: Bitmap, s: ProcessingSettings): BooleanArray {
+        val baseRadius = if (s.smoothEdges) max(2, s.blurRadius.coerceIn(2, 4)) else 1
+        val coarse = cannyLikeMask(gaussianBlur(bitmap, baseRadius + 1),
+            (s.edgeStrength + 10).coerceIn(35, 95), keepFine = false)
+        val fine = cannyLikeMask(gaussianBlur(bitmap, baseRadius),
+            s.edgeStrength.coerceIn(30, 90), keepFine = true)
+
+        val w = bitmap.width
+        val h = bitmap.height
+        val out = BooleanArray(w * h)
+        for (i in out.indices) if (coarse[i]) out[i] = true
+
+        // Fine detail is retained only when it is connected/near a structural edge.
+        // This is the key step that prevents fur/skin/photo grain from becoming thousands
+        // of isolated purple dots.
+        for (y in 2 until h - 2) {
+            for (x in 2 until w - 2) {
+                val i = y * w + x
+                if (!fine[i] || out[i]) continue
+                var nearStructure = false
+                loop@ for (dy in -2..2) for (dx in -2..2) {
+                    if (dx == 0 && dy == 0) continue
+                    if (coarse[(y + dy) * w + x + dx]) { nearStructure = true; break@loop }
+                }
+                if (nearStructure) out[i] = true
+            }
+        }
+        return out
+    }
+
+    /** Legacy clean path kept for the other processing modes. */
     private fun cleanLinesMask(bitmap: Bitmap, s: ProcessingSettings): BooleanArray {
         val radius = if (s.smoothEdges) max(2, s.blurRadius.coerceIn(1, 3)) else 1
-        val softened = gaussianBlur(bitmap, radius)
-        return cannyLikeMask(softened, s.edgeStrength, keepFine = false)
+        return cannyLikeMask(gaussianBlur(bitmap, radius), s.edgeStrength, keepFine = false)
     }
 
     private fun fineDetailMask(bitmap: Bitmap, s: ProcessingSettings): BooleanArray {
@@ -229,9 +264,11 @@ object ImageProcessor {
         for (v in nms) if (v > 0) { histogram[v]++; count++ }
         if (count == 0) return BooleanArray(w * h)
         val percentile = if (keepFine) {
-            0.82f - (strength - 50).coerceIn(-30, 30) * 0.002f
+            // Fine pass: still selective, but allowed to recover useful internal detail.
+            0.90f - (strength - 50).coerceIn(-30, 30) * 0.0015f
         } else {
-            0.93f - (strength - 50).coerceIn(-30, 30) * 0.0025f
+            // Structural pass: keep only the strongest few percent of stable edges.
+            0.975f - (strength - 50).coerceIn(-30, 30) * 0.0015f
         }
         val highRank = (count * percentile.coerceIn(0.72f, 0.97f)).toInt().coerceIn(1, count)
         var seen = 0
@@ -300,7 +337,7 @@ object ImageProcessor {
         val out = BooleanArray(mask.size)
         val stack = IntArray(mask.size)
         val component = IntArray(mask.size)
-        val minSize = if (preserveDetail) max(18, (w * h) / 260000) else max(30, (w * h) / 170000)
+        val minSize = if (preserveDetail) max(42, (w * h) / 110000) else max(65, (w * h) / 80000)
 
         for (start in mask.indices) {
             if (!mask[start] || visited[start]) continue
@@ -324,7 +361,19 @@ object ImageProcessor {
                     }
                 }
             }
-            if (size >= minSize) for (j in 0 until size) out[component[j]] = true
+            if (size >= minSize) {
+                var minX = w; var maxX = 0; var minY = h; var maxY = 0
+                for (j in 0 until size) {
+                    val p = component[j]; val cy = p / w; val cx = p - cy * w
+                    if (cx < minX) minX = cx; if (cx > maxX) maxX = cx
+                    if (cy < minY) minY = cy; if (cy > maxY) maxY = cy
+                }
+                val span = max(maxX - minX, maxY - minY)
+                // Tiny compact blobs are photographic noise; long/connected strokes survive.
+                if (span >= 7 || size >= minSize * 3) {
+                    for (j in 0 until size) out[component[j]] = true
+                }
+            }
         }
         return out
     }

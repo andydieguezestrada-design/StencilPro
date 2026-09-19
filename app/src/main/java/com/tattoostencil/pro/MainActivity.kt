@@ -121,7 +121,14 @@ fun StencilProApp() {
         topBar = {
             TopAppBar(
                 title = { Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Brush, null); Spacer(Modifier.width(8.dp)); Text("StencilPro", fontWeight = FontWeight.Bold, fontSize = 22.sp) } },
-                actions = { IconButton({ showSettings = true }) { Icon(Icons.Default.Tune, "Ajustes") } }
+                actions = {
+                    if (result != null && !loading) {
+                        IconButton(onClick = { result?.let { saveBitmap(context, it)?.let { uri -> history = addHistory(context, uri) } } }) {
+                            Icon(Icons.Default.SaveAlt, "Guardar en galería")
+                        }
+                    }
+                    IconButton(onClick = { showSettings = true }) { Icon(Icons.Default.Tune, "Ajustes") }
+                }
             )
         },
         bottomBar = {
@@ -150,13 +157,11 @@ fun StencilProApp() {
             if (original != null && tab != 2) {
                 Spacer(Modifier.height(10.dp))
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                    Text("Vista", fontWeight = FontWeight.Bold)
+                    Text("Vista previa", fontWeight = FontWeight.Bold)
                     Spacer(Modifier.weight(1f))
-                    Text(if (compareOriginal) "Original" else "Stencil")
+                    Text(if (compareOriginal) "Original" else "Plantilla limpia")
                     Switch(checked = compareOriginal, onCheckedChange = { compareOriginal = it })
                 }
-                PreviewCard(if (compareOriginal) original else result, loading)
-                Spacer(Modifier.height(10.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = { result?.let { saveBitmap(context, it)?.let { uri -> history = addHistory(context, uri) } } },
@@ -177,6 +182,8 @@ fun StencilProApp() {
                         Text("Compartir")
                     }
                 }
+                Spacer(Modifier.height(10.dp))
+                PreviewCard(if (compareOriginal) original else result, loading)
                 Spacer(Modifier.height(8.dp))
                 OutlinedButton(
                     onClick = { original = null; result = null },
@@ -188,7 +195,12 @@ fun StencilProApp() {
                 }
                 Spacer(Modifier.height(12.dp))
                 Text("Tipo de plantilla", fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(6.dp))
+                Text(
+                    if (filter == FilterType.CLEAN_LINES) "Modo profesional: líneas estructurales limpias, sin textura fotográfica." else filter.description,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 3.dp, bottom = 6.dp)
+                )
                 FilterSelector(filter) { filter = it; process(original!!) }
                 Spacer(Modifier.height(12.dp))
             }
