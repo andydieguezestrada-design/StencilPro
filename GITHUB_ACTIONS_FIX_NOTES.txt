@@ -1,0 +1,20 @@
+StencilPro - GitHub Actions compatibility update
+
+Updated .github/workflows/build.yml to remove the Node.js 20 deprecation warnings and the
+upcoming ubuntu-latest migration notice:
+
+- actions/checkout: v4 -> v7 (Node.js 24 runtime)
+- actions/setup-java: v4 -> v6 (Node.js 24 runtime)
+- gradle/actions/setup-gradle: v4 -> v6 (Node.js 24 runtime)
+- actions/upload-artifact: v4 -> v7 (Node.js 24 runtime)
+- runs-on: ubuntu-latest -> ubuntu-24.04 (keeps the runner OS stable instead of following
+  the announced Ubuntu 26 migration)
+
+The Android/Gradle build configuration was not otherwise changed in this fix.
+Gradle 8.7 and JDK 17 were intentionally kept because they are part of the existing
+Android build configuration and changing them unnecessarily could introduce unrelated
+compatibility issues.
+
+These changes address the annotations shown in the GitHub Actions screenshot. They do
+not by themselves guarantee that the Android source compiles; the build log must still
+be checked for any Kotlin/Gradle errors after this workflow update.
