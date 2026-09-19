@@ -1,0 +1,4 @@
+StencilPro build fix v2
+- Enabled AndroidX: android.useAndroidX=true
+- Enabled Jetifier: android.enableJetifier=true
+- Preserved previous Kotlin DSL brace fix.
