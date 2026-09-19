@@ -2,19 +2,23 @@ package com.tattoostencil.pro.processing
 
 import android.graphics.Bitmap
 import android.graphics.Color
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
-/** Fast, deterministic image processing intended for tattoo-stencil preparation. */
+/**
+ * Deterministic image processing for tattoo stencil preparation.
+ * CLEAN_LINES is intentionally conservative: it suppresses photographic texture,
+ * keeps strong structural edges, thins them to one-pixel contours and removes
+ * small disconnected marks before the final line colour is applied.
+ */
 object ImageProcessor {
     enum class FilterType(val displayName: String, val description: String) {
-        CLEAN_LINES("Líneas limpias", "Contornos y detalles internos, fondo blanco"),
-        FINE_DETAIL("Fine detail", "Más información interna y líneas finas"),
-        THRESHOLD("Umbral", "Convierte zonas oscuras en líneas/masas de guía"),
+        CLEAN_LINES("Líneas limpias", "Contornos principales y detalles útiles, fondo blanco"),
+        FINE_DETAIL("Detalle fino", "Más información interna, con limpieza moderada"),
+        THRESHOLD("Umbral", "Guía binaria; puede producir masas"),
         SKETCH("Sketch", "Boceto de referencia"),
-        HIGH_CONTRAST("Alto contraste", "Contraste fuerte para transferencia"),
+        HIGH_CONTRAST("Alto contraste", "Guía de alto contraste"),
         INVERT("Invertido", "Invierte el resultado")
     }
 
@@ -27,13 +31,13 @@ object ImageProcessor {
 
     data class ProcessingSettings(
         val brightness: Float = 0f,
-        val contrast: Float = 1.12f,
-        val threshold: Int = 42,
-        val blurRadius: Int = 1,
-        val edgeStrength: Int = 45,
+        val contrast: Float = 1.05f,
+        val threshold: Int = 48,
+        val blurRadius: Int = 2,
+        val edgeStrength: Int = 62,
         val invertColors: Boolean = false,
         val smoothEdges: Boolean = true,
-        val lineWidth: Int = 1,
+        val lineWidth: Int = 2,
         val removeNoise: Boolean = true,
         val preserveDetail: Boolean = true,
         val backgroundWhite: Boolean = true,
@@ -42,51 +46,68 @@ object ImageProcessor {
     )
 
     fun processImage(bitmap: Bitmap, filterType: FilterType, settings: ProcessingSettings): Bitmap {
-        val source = normalize(bitmap, settings.maxOutputSize)
-        var gray = toGrayscale(source)
+        // Keep the imported image/output reasonably large, but do the expensive edge analysis
+        // on a smaller working copy. This prevents 2400px photos from exhausting Android RAM.
+        val outputSource = normalize(bitmap, settings.maxOutputSize)
+        val analysisSize = min(settings.maxOutputSize, 1600)
+        var gray = toGrayscale(normalize(outputSource, analysisSize))
         if (settings.brightness != 0f || settings.contrast != 1f) {
             gray = adjustBrightnessContrast(gray, settings.brightness, settings.contrast)
         }
-        if (settings.smoothEdges && settings.blurRadius > 0) {
-            gray = gaussianBlur(gray, settings.blurRadius.coerceIn(1, 3))
-        }
 
-        val binary: BooleanArray
         val width = gray.width
         val height = gray.height
-        binary = when (filterType) {
-            FilterType.CLEAN_LINES -> edgeMask(gray, settings, fine = false)
-            FilterType.FINE_DETAIL -> edgeMask(gray, settings, fine = true)
+        val mask = when (filterType) {
+            FilterType.CLEAN_LINES -> cleanLinesMask(gray, settings)
+            FilterType.FINE_DETAIL -> fineDetailMask(gray, settings)
             FilterType.THRESHOLD -> thresholdMask(gray, settings.threshold)
-            FilterType.SKETCH -> sketchMask(gray, settings.threshold)
+            FilterType.SKETCH -> sketchMask(gray, settings)
             FilterType.HIGH_CONTRAST -> thresholdMask(gray, settings.threshold.coerceIn(1, 254))
             FilterType.INVERT -> invertMask(gray)
         }
 
-        var mask = binary
-        if (settings.removeNoise) mask = cleanMask(mask, width, height, if (settings.preserveDetail) 1 else 2)
-        if (settings.lineWidth > 1) mask = thicken(mask, width, height, settings.lineWidth - 1)
+        var finalMask = mask
+        if (settings.removeNoise && filterType != FilterType.THRESHOLD && filterType != FilterType.HIGH_CONTRAST) {
+            finalMask = removeSmallComponents(finalMask, width, height, settings.preserveDetail)
+            finalMask = cleanMask(finalMask, width, height, if (settings.preserveDetail) 2 else 3)
+        }
+        if (settings.lineWidth > 1 && filterType != FilterType.THRESHOLD && filterType != FilterType.HIGH_CONTRAST) {
+            finalMask = thicken(finalMask, width, height, settings.lineWidth - 1)
+        }
 
-        val out = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val analysisOut = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val pixels = IntArray(width * height)
         val line = settings.lineColor.color
         for (i in pixels.indices) {
-            val on = mask[i]
+            val on = finalMask[i]
             pixels[i] = if (on xor settings.invertColors) line else Color.WHITE
         }
-        out.setPixels(pixels, 0, width, 0, 0, width, height)
-        return out
+        analysisOut.setPixels(pixels, 0, width, 0, 0, width, height)
+        return if (analysisOut.width == outputSource.width && analysisOut.height == outputSource.height) {
+            analysisOut
+        } else {
+            Bitmap.createScaledBitmap(analysisOut, outputSource.width, outputSource.height, true).also {
+                analysisOut.recycle()
+            }
+        }
     }
 
     fun normalize(bitmap: Bitmap, maxSize: Int): Bitmap {
         if (bitmap.width <= maxSize && bitmap.height <= maxSize) return bitmap.copy(Bitmap.Config.ARGB_8888, false)
         val scale = min(maxSize.toFloat() / bitmap.width, maxSize.toFloat() / bitmap.height)
-        return Bitmap.createScaledBitmap(bitmap, max(1, (bitmap.width * scale).toInt()), max(1, (bitmap.height * scale).toInt()), true)
+        return Bitmap.createScaledBitmap(
+            bitmap,
+            max(1, (bitmap.width * scale).toInt()),
+            max(1, (bitmap.height * scale).toInt()),
+            true
+        )
     }
 
     fun toGrayscale(bitmap: Bitmap): Bitmap {
-        val w = bitmap.width; val h = bitmap.height
-        val src = IntArray(w * h); bitmap.getPixels(src, 0, w, 0, 0, w, h)
+        val w = bitmap.width
+        val h = bitmap.height
+        val src = IntArray(w * h)
+        bitmap.getPixels(src, 0, w, 0, 0, w, h)
         val dst = IntArray(src.size)
         for (i in src.indices) {
             val p = src[i]
@@ -97,8 +118,10 @@ object ImageProcessor {
     }
 
     fun adjustBrightnessContrast(bitmap: Bitmap, brightness: Float, contrast: Float): Bitmap {
-        val w = bitmap.width; val h = bitmap.height
-        val src = IntArray(w * h); bitmap.getPixels(src, 0, w, 0, 0, w, h)
+        val w = bitmap.width
+        val h = bitmap.height
+        val src = IntArray(w * h)
+        bitmap.getPixels(src, 0, w, 0, 0, w, h)
         val dst = IntArray(src.size)
         val factor = contrast.coerceIn(0.1f, 3f)
         for (i in src.indices) {
@@ -110,69 +133,200 @@ object ImageProcessor {
 
     fun gaussianBlur(bitmap: Bitmap, radius: Int): Bitmap {
         if (radius <= 0) return bitmap
-        val w = bitmap.width; val h = bitmap.height
-        val src = IntArray(w * h); bitmap.getPixels(src, 0, w, 0, 0, w, h)
-        val tmp = IntArray(src.size); val dst = IntArray(src.size)
+        val w = bitmap.width
+        val h = bitmap.height
+        val src = IntArray(w * h)
+        bitmap.getPixels(src, 0, w, 0, 0, w, h)
+        val tmp = IntArray(src.size)
+        val dst = IntArray(src.size)
         val size = radius * 2 + 1
         val kernel = IntArray(size)
         var sum = 0
-        for (i in 0 until size) { val x = i - radius; kernel[i] = max(1, (1000 * kotlin.math.exp(-(x * x) / (2.0 * radius * radius))).toInt()); sum += kernel[i] }
+        for (i in 0 until size) {
+            val x = i - radius
+            kernel[i] = max(1, (1000 * kotlin.math.exp(-(x * x) / (2.0 * radius * radius))).toInt())
+            sum += kernel[i]
+        }
         for (y in 0 until h) for (x in 0 until w) {
             var s = 0
-            for (k in -radius..radius) s += Color.red(src[y * w + (x + k).coerceIn(0, w - 1)]) * kernel[k + radius]
+            for (k in -radius..radius) {
+                s += Color.red(src[y * w + (x + k).coerceIn(0, w - 1)]) * kernel[k + radius]
+            }
             tmp[y * w + x] = s / sum
         }
         for (y in 0 until h) for (x in 0 until w) {
             var s = 0
-            for (k in -radius..radius) s += tmp[(y + k).coerceIn(0, h - 1) * w + x] * kernel[k + radius]
-            dst[y * w + x] = Color.rgb(s / sum, s / sum, s / sum)
+            for (k in -radius..radius) {
+                s += tmp[(y + k).coerceIn(0, h - 1) * w + x] * kernel[k + radius]
+            }
+            val v = s / sum
+            dst[y * w + x] = Color.rgb(v, v, v)
         }
         return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { it.setPixels(dst, 0, w, 0, 0, w, h) }
     }
 
-    private fun edgeMask(bitmap: Bitmap, s: ProcessingSettings, fine: Boolean): BooleanArray {
-        val w = bitmap.width; val h = bitmap.height
-        val src = IntArray(w * h); bitmap.getPixels(src, 0, w, 0, 0, w, h)
+    /** Main professional-style path: suppress texture, then extract stable structural edges. */
+    private fun cleanLinesMask(bitmap: Bitmap, s: ProcessingSettings): BooleanArray {
+        val radius = if (s.smoothEdges) max(2, s.blurRadius.coerceIn(1, 3)) else 1
+        val softened = gaussianBlur(bitmap, radius)
+        return cannyLikeMask(softened, s.edgeStrength, keepFine = false)
+    }
+
+    private fun fineDetailMask(bitmap: Bitmap, s: ProcessingSettings): BooleanArray {
+        val radius = if (s.smoothEdges) s.blurRadius.coerceIn(1, 2) else 0
+        val softened = if (radius > 0) gaussianBlur(bitmap, radius) else bitmap
+        return cannyLikeMask(softened, (s.edgeStrength - 12).coerceIn(20, 85), keepFine = true)
+    }
+
+    /** Sobel magnitude + non-maximum suppression + hysteresis, rather than raw pixel edges. */
+    private fun cannyLikeMask(bitmap: Bitmap, strength: Int, keepFine: Boolean): BooleanArray {
+        val w = bitmap.width
+        val h = bitmap.height
+        val src = IntArray(w * h)
+        bitmap.getPixels(src, 0, w, 0, 0, w, h)
         val mag = IntArray(w * h)
+        val angle = ByteArray(w * h)
         var maxMag = 1
+
+        for (y in 1 until h - 1) {
+            for (x in 1 until w - 1) {
+                val i = y * w + x
+                val a = Color.red(src[i - w - 1]); val b = Color.red(src[i - w]); val c = Color.red(src[i - w + 1])
+                val d = Color.red(src[i - 1]); val f = Color.red(src[i + 1])
+                val g = Color.red(src[i + w - 1]); val hh = Color.red(src[i + w]); val j = Color.red(src[i + w + 1])
+                val gx = -a - 2 * d - g + c + 2 * f + j
+                val gy = -a - 2 * b - c + g + 2 * hh + j
+                val m = sqrt((gx * gx + gy * gy).toDouble()).toInt()
+                mag[i] = m
+                if (m > maxMag) maxMag = m
+                val deg = Math.toDegrees(kotlin.math.atan2(gy.toDouble(), gx.toDouble()))
+                angle[i] = when {
+                    deg < 0.0 -> (((deg + 180.0) / 22.5).toInt() and 7).toByte()
+                    else -> ((deg / 22.5).toInt() and 7).toByte()
+                }
+            }
+        }
+
+        val nms = IntArray(w * h)
         for (y in 1 until h - 1) for (x in 1 until w - 1) {
             val i = y * w + x
-            val a = Color.red(src[i - w - 1]); val b = Color.red(src[i - w]); val c = Color.red(src[i - w + 1])
-            val d = Color.red(src[i - 1]); val f = Color.red(src[i + 1])
-            val g = Color.red(src[i + w - 1]); val hh = Color.red(src[i + w]); val j = Color.red(src[i + w + 1])
-            val gx = -a - 2*d - g + c + 2*f + j
-            val gy = -a - 2*b - c + g + 2*hh + j
-            val m = sqrt((gx * gx + gy * gy).toDouble()).toInt()
-            mag[i] = m; if (m > maxMag) maxMag = m
+            val m = mag[i]
+            if (m == 0) continue
+            val dir = angle[i].toInt() and 7
+            val (p, q) = when (dir) {
+                0, 4 -> mag[i - 1] to mag[i + 1]
+                1, 5 -> mag[i - w + 1] to mag[i + w - 1]
+                2, 6 -> mag[i - w] to mag[i + w]
+                else -> mag[i - w - 1] to mag[i + w + 1]
+            }
+            if (m >= p && m >= q) nms[i] = m
         }
-        val threshold = max(8, (maxMag * (100 - s.edgeStrength.coerceIn(1, 95)) / 100))
-        val out = BooleanArray(w * h)
-        for (y in 1 until h - 1) for (x in 1 until w - 1) {
-            val i = y * w + x; val m = mag[i]
-            if (m < threshold) continue
-            // Keep local maxima. Fine-detail accepts slightly weaker edges.
-            val neighbor = max(max(mag[i-1], mag[i+1]), max(mag[i-w], mag[i+w]))
-            out[i] = m >= neighbor - if (fine) 18 else 4
+
+        // Use a percentile instead of a percentage of the single strongest pixel.
+        // This prevents one hard photographic edge from making thousands of weak texture edges pass.
+        val histogram = IntArray(maxMag + 1)
+        var count = 0
+        for (v in nms) if (v > 0) { histogram[v]++; count++ }
+        if (count == 0) return BooleanArray(w * h)
+        val percentile = if (keepFine) {
+            0.82f - (strength - 50).coerceIn(-30, 30) * 0.002f
+        } else {
+            0.93f - (strength - 50).coerceIn(-30, 30) * 0.0025f
         }
-        return out
+        val highRank = (count * percentile.coerceIn(0.72f, 0.97f)).toInt().coerceIn(1, count)
+        var seen = 0
+        var high = 1
+        for (v in histogram.indices.reversed()) {
+            seen += histogram[v]
+            if (seen >= highRank) { high = v; break }
+        }
+        high = high.coerceAtLeast(if (keepFine) 18 else 24)
+        val low = max(8, (high * if (keepFine) 0.42f else 0.50f).toInt())
+
+        // Hysteresis: weak edges survive only if connected to a strong edge.
+        val state = ByteArray(w * h) // 0 none, 1 weak, 2 strong
+        val queue = IntArray(w * h)
+        var head = 0
+        var tail = 0
+        for (i in nms.indices) {
+            when {
+                nms[i] >= high -> { state[i] = 2; queue[tail++] = i }
+                nms[i] >= low -> state[i] = 1
+            }
+        }
+        val result = BooleanArray(w * h)
+        while (head < tail) {
+            val i = queue[head++]
+            result[i] = true
+            val y = i / w
+            val x = i - y * w
+            for (dy in -1..1) for (dx in -1..1) {
+                if (dx == 0 && dy == 0) continue
+                val nx = x + dx
+                val ny = y + dy
+                if (nx !in 1 until w - 1 || ny !in 1 until h - 1) continue
+                val ni = ny * w + nx
+                if (state[ni] == 1) {
+                    state[ni] = 2
+                    queue[tail++] = ni
+                }
+            }
+        }
+        return result
     }
 
     private fun thresholdMask(bitmap: Bitmap, threshold: Int): BooleanArray {
-        val w = bitmap.width; val h = bitmap.height
-        val src = IntArray(w * h); bitmap.getPixels(src, 0, w, 0, 0, w, h)
-        val out = BooleanArray(src.size)
-        for (i in src.indices) out[i] = Color.red(src[i]) < threshold.coerceIn(1, 254)
-        return out
+        val w = bitmap.width
+        val h = bitmap.height
+        val src = IntArray(w * h)
+        bitmap.getPixels(src, 0, w, 0, 0, w, h)
+        return BooleanArray(src.size) { Color.red(src[it]) < threshold.coerceIn(1, 254) }
     }
 
-    private fun sketchMask(bitmap: Bitmap, threshold: Int): BooleanArray {
-        return edgeMask(bitmap, ProcessingSettings(threshold = threshold, edgeStrength = 35, smoothEdges = false), fine = true)
-    }
+    private fun sketchMask(bitmap: Bitmap, s: ProcessingSettings): BooleanArray =
+        cannyLikeMask(bitmap, (s.edgeStrength - 5).coerceIn(15, 90), keepFine = true)
 
     private fun invertMask(bitmap: Bitmap): BooleanArray {
-        val w = bitmap.width; val h = bitmap.height
-        val src = IntArray(w * h); bitmap.getPixels(src, 0, w, 0, 0, w, h)
+        val w = bitmap.width
+        val h = bitmap.height
+        val src = IntArray(w * h)
+        bitmap.getPixels(src, 0, w, 0, 0, w, h)
         return BooleanArray(src.size) { Color.red(src[it]) > 180 }
+    }
+
+    /** Remove isolated specks/short texture fragments with a small connected-component pass. */
+    private fun removeSmallComponents(mask: BooleanArray, w: Int, h: Int, preserveDetail: Boolean): BooleanArray {
+        val visited = BooleanArray(mask.size)
+        val out = BooleanArray(mask.size)
+        val stack = IntArray(mask.size)
+        val component = IntArray(mask.size)
+        val minSize = if (preserveDetail) max(18, (w * h) / 260000) else max(30, (w * h) / 170000)
+
+        for (start in mask.indices) {
+            if (!mask[start] || visited[start]) continue
+            var top = 0
+            var size = 0
+            stack[top++] = start
+            visited[start] = true
+            while (top > 0) {
+                val i = stack[--top]
+                component[size++] = i
+                val y = i / w
+                val x = i - y * w
+                for (dy in -1..1) for (dx in -1..1) {
+                    if (dx == 0 && dy == 0) continue
+                    val nx = x + dx; val ny = y + dy
+                    if (nx !in 0 until w || ny !in 0 until h) continue
+                    val ni = ny * w + nx
+                    if (mask[ni] && !visited[ni]) {
+                        visited[ni] = true
+                        stack[top++] = ni
+                    }
+                }
+            }
+            if (size >= minSize) for (j in 0 until size) out[component[j]] = true
+        }
+        return out
     }
 
     private fun cleanMask(mask: BooleanArray, w: Int, h: Int, minNeighbors: Int): BooleanArray {
@@ -181,7 +335,9 @@ object ImageProcessor {
             val i = y * w + x
             if (!mask[i]) continue
             var n = 0
-            for (dy in -1..1) for (dx in -1..1) if (dx != 0 || dy != 0) if (mask[(y + dy) * w + x + dx]) n++
+            for (dy in -1..1) for (dx in -1..1) {
+                if (dx != 0 || dy != 0) if (mask[(y + dy) * w + x + dx]) n++
+            }
             if (n < minNeighbors) out[i] = false
         }
         return out
@@ -189,7 +345,7 @@ object ImageProcessor {
 
     private fun thicken(mask: BooleanArray, w: Int, h: Int, amount: Int): BooleanArray {
         var current = mask
-        repeat(amount.coerceIn(1, 3)) {
+        repeat(amount.coerceIn(1, 2)) {
             val next = current.copyOf()
             for (y in 1 until h - 1) for (x in 1 until w - 1) {
                 val i = y * w + x

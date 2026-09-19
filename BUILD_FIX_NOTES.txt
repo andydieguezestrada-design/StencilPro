@@ -2,3 +2,11 @@ StencilPro build fix v2
 - Enabled AndroidX: android.useAndroidX=true
 - Enabled Jetifier: android.enableJetifier=true
 - Preserved previous Kotlin DSL brace fix.
+
+v5 functionality fix
+- Replaced the old raw Sobel threshold path for CLEAN_LINES with a Canny-like multi-stage edge pipeline: smoothing, non-maximum suppression, percentile thresholding, hysteresis, and connected-component cleanup.
+- CLEAN_LINES now targets structural contours instead of photographic micro-texture/speckle.
+- Default stencil settings were tuned for clean, defined lines.
+- Expensive edge analysis is capped at a 1600px working image and the clean stencil is scaled back to the normalized output size to reduce Android RAM pressure.
+- The save action is now immediately visible below the preview as "Guardar en galería" and uses MediaStore/Pictures/StencilPro with failure cleanup.
+- GitHub Actions updated to Node 24-compatible action versions and Ubuntu 24.04.

@@ -157,13 +157,39 @@ fun StencilProApp() {
                 }
                 PreviewCard(if (compareOriginal) original else result, loading)
                 Spacer(Modifier.height(10.dp))
-                FilterSelector(filter) { filter = it; process(original!!) }
-                Spacer(Modifier.height(10.dp))
-                OutlinedButton(onClick = { result?.let { saveBitmap(context, it)?.let { uri -> history = addHistory(context, uri) } } }, enabled = result != null, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Save, null); Spacer(Modifier.width(8.dp)); Text("Guardar stencil en Fotos") }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = { result?.let { shareBitmap(context, it) } }, enabled = result != null, modifier = Modifier.weight(1f)) { Icon(Icons.Default.Share, null); Spacer(Modifier.width(4.dp)); Text("Compartir") }
-                    OutlinedButton(onClick = { original = null; result = null }, modifier = Modifier.weight(1f)) { Icon(Icons.Default.Delete, null); Spacer(Modifier.width(4.dp)); Text("Limpiar") }
+                    Button(
+                        onClick = { result?.let { saveBitmap(context, it)?.let { uri -> history = addHistory(context, uri) } } },
+                        enabled = result != null && !loading,
+                        modifier = Modifier.weight(1.25f)
+                    ) {
+                        Icon(Icons.Default.SaveAlt, null)
+                        Spacer(Modifier.width(6.dp))
+                        Text("Guardar en galería")
+                    }
+                    OutlinedButton(
+                        onClick = { result?.let { shareBitmap(context, it) } },
+                        enabled = result != null && !loading,
+                        modifier = Modifier.weight(0.9f)
+                    ) {
+                        Icon(Icons.Default.Share, null)
+                        Spacer(Modifier.width(4.dp))
+                        Text("Compartir")
+                    }
                 }
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = { original = null; result = null },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.Delete, null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("Limpiar imagen")
+                }
+                Spacer(Modifier.height(12.dp))
+                Text("Tipo de plantilla", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(6.dp))
+                FilterSelector(filter) { filter = it; process(original!!) }
                 Spacer(Modifier.height(12.dp))
             }
         }
@@ -254,14 +280,39 @@ fun toast(context: Context, text: String) = Toast.makeText(context, text, Toast.
 
 fun saveBitmap(context: Context, bitmap: Bitmap): Uri? {
     val name = "StencilPro_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.png"
+    val resolver = context.contentResolver
+    var uri: Uri? = null
     return try {
-        val resolver = context.contentResolver
-        val values = ContentValues().apply { put(MediaStore.Images.Media.DISPLAY_NAME, name); put(MediaStore.Images.Media.MIME_TYPE, "image/png"); if (Build.VERSION.SDK_INT >= 29) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/StencilPro"); if (Build.VERSION.SDK_INT >= 29) put(MediaStore.Images.Media.IS_PENDING, 1) }
-        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
-        resolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
-        if (Build.VERSION.SDK_INT >= 29) resolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
-        toast(context, "Stencil guardado en Fotos/StencilPro"); uri
-    } catch (e: Exception) { toast(context, "No se pudo guardar: ${e.message}"); null }
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+            if (Build.VERSION.SDK_INT >= 29) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/StencilPro")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+        }
+        uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: throw IllegalStateException("Galería no disponible")
+        val wrote = resolver.openOutputStream(uri)?.use { output ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+        } ?: false
+        if (!wrote) throw IllegalStateException("No se pudo escribir el PNG")
+
+        if (Build.VERSION.SDK_INT >= 29) {
+            resolver.update(
+                uri,
+                ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) },
+                null,
+                null
+            )
+        }
+        toast(context, "Stencil guardado en Galería → Pictures/StencilPro")
+        uri
+    } catch (e: Exception) {
+        uri?.let { runCatching { resolver.delete(it, null, null) } }
+        toast(context, "No se pudo guardar en la galería: ${e.message ?: "error desconocido"}")
+        null
+    }
 }
 
 fun shareBitmap(context: Context, bitmap: Bitmap) {
