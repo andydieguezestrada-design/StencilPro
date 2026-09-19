@@ -1,11 +1,17 @@
 package com.tattoostencil.pro
 
+import android.Manifest
+import android.app.Activity
+import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.os.Environment
+import android.provider.MediaStore
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -24,656 +30,270 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.tattoostencil.pro.processing.ImageProcessor
 import com.tattoostencil.pro.processing.ImageProcessor.FilterType
+import com.tattoostencil.pro.processing.ImageProcessor.LineColor
 import com.tattoostencil.pro.processing.ImageProcessor.ProcessingSettings
 import com.tattoostencil.pro.ui.theme.StencilProTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent {
-            StencilProTheme {
-                StencilProApp()
-            }
-        }
+        setContent { StencilProTheme { StencilProApp() } }
     }
 }
+
+data class HistoryItem(val uri: String, val name: String, val date: Long)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun StencilProApp() {
-    var originalBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var processedBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var selectedFilter by remember { mutableStateOf(FilterType.CANNY_EDGE) }
-    var settings by remember { mutableStateOf(ProcessingSettings()) }
-    var showSettings by remember { mutableStateOf(false) }
-    var currentTab by remember { mutableStateOf(0) }
-    var isLoading by remember { mutableStateOf(false) }
-    
     val context = LocalContext.current
-    
-    // Launcher para galería
-    val galleryLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        uri?.let {
-            isLoading = true
-            try {
-                val inputStream = context.contentResolver.openInputStream(it)
-                val bitmap = BitmapFactory.decodeStream(inputStream)
-                originalBitmap = bitmap
-                processedBitmap = ImageProcessor.processImage(bitmap, selectedFilter, settings)
-            } catch (e: Exception) {
-                Toast.makeText(context, "Error al cargar imagen", Toast.LENGTH_SHORT).show()
-            } finally {
-                isLoading = false
+    val scope = rememberCoroutineScope()
+    var original by remember { mutableStateOf<Bitmap?>(null) }
+    var result by remember { mutableStateOf<Bitmap?>(null) }
+    var filter by remember { mutableStateOf(FilterType.CLEAN_LINES) }
+    var settings by remember { mutableStateOf(ProcessingSettings()) }
+    var tab by remember { mutableStateOf(0) }
+    var loading by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
+    var compareOriginal by remember { mutableStateOf(false) }
+    var history by remember { mutableStateOf(loadHistory(context)) }
+    var processingJob by remember { mutableStateOf<Job?>(null) }
+
+    fun process(source: Bitmap, f: FilterType = filter, s: ProcessingSettings = settings) {
+        processingJob?.cancel()
+        loading = true
+        processingJob = scope.launch {
+            val processed = withContext(Dispatchers.Default) { ImageProcessor.processImage(source, f, s) }
+            result = processed
+            loading = false
+        }
+    }
+
+    fun acceptBitmap(bitmap: Bitmap) {
+        original?.let { if (it !== bitmap && !it.isRecycled) it.recycle() }
+        original = ImageProcessor.normalize(bitmap, settings.maxOutputSize)
+        process(original!!)
+    }
+
+    val galleryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            scope.launch {
+                loading = true
+                val bmp = withContext(Dispatchers.IO) { context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) } }
+                loading = false
+                if (bmp != null) acceptBitmap(bmp) else toast(context, "No se pudo abrir la imagen")
             }
         }
     }
-    
-    // Launcher para cámara
-    val cameraLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.TakePicturePreview()
-    ) { bitmap: Bitmap? ->
-        bitmap?.let {
-            originalBitmap = it
-            processedBitmap = ImageProcessor.processImage(it, selectedFilter, settings)
-        }
+
+    var pendingCamera by remember { mutableStateOf(false) }
+    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) pendingCamera = true else toast(context, "Permiso de cámara denegado")
     }
-    
+    val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicturePreview()) { bmp ->
+        pendingCamera = false
+        if (bmp != null) acceptBitmap(bmp)
+    }
+    LaunchedEffect(pendingCamera) {
+        if (pendingCamera) cameraLauncher.launch(null)
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            Icons.Default.Brush,
-                            contentDescription = null,
-                            modifier = Modifier.size(28.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            "StencilPro",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 24.sp
-                        )
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimary
-                ),
-                actions = {
-                    IconButton(onClick = { showSettings = true }) {
-                        Icon(
-                            Icons.Default.Settings,
-                            contentDescription = "Ajustes",
-                            tint = MaterialTheme.colorScheme.onPrimary
-                        )
-                    }
-                }
+                title = { Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Brush, null); Spacer(Modifier.width(8.dp)); Text("StencilPro", fontWeight = FontWeight.Bold, fontSize = 22.sp) } },
+                actions = { IconButton({ showSettings = true }) { Icon(Icons.Default.Tune, "Ajustes") } }
             )
         },
         bottomBar = {
             NavigationBar {
-                NavigationBarItem(
-                    icon = { Icon(Icons.Default.Image, contentDescription = "Galería") },
-                    label = { Text("Galería") },
-                    selected = currentTab == 0,
-                    onClick = { currentTab = 0 }
-                )
-                NavigationBarItem(
-                    icon = { Icon(Icons.Default.CameraAlt, contentDescription = "Cámara") },
-                    label = { Text("Cámara") },
-                    selected = currentTab == 1,
-                    onClick = { currentTab = 1 }
-                )
-                NavigationBarItem(
-                    icon = { Icon(Icons.Default.History, contentDescription = "Historial") },
-                    label = { Text("Historial") },
-                    selected = currentTab == 2,
-                    onClick = { currentTab = 2 }
-                )
-            }
-        }
-    ) { paddingValues ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(paddingValues)
-                .padding(16.dp)
-        ) {
-            when (currentTab) {
-                0 -> GalleryTab(
-                    originalBitmap = originalBitmap,
-                    processedBitmap = processedBitmap,
-                    isLoading = isLoading,
-                    onImageSelected = { galleryLauncher.launch("image/*") }
-                )
-                1 -> CameraTab(
-                    originalBitmap = originalBitmap,
-                    processedBitmap = processedBitmap,
-                    onCapture = { cameraLauncher.launch(null) }
-                )
-                2 -> HistoryTab()
-            }
-            
-            if (originalBitmap != null) {
-                Spacer(modifier = Modifier.height(16.dp))
-                FilterSelector(
-                    selectedFilter = selectedFilter,
-                    onFilterSelected = { filter ->
-                        selectedFilter = filter
-                        isLoading = true
-                        processedBitmap = ImageProcessor.processImage(
-                            originalBitmap!!,
-                            filter,
-                            settings
-                        )
-                        isLoading = false
-                    }
-                )
-                
-                Spacer(modifier = Modifier.height(16.dp))
-                ActionButtons(
-                    processedBitmap = processedBitmap,
-                    onReset = {
-                        originalBitmap = null
-                        processedBitmap = null
-                    },
-                    onSave = {
-                        saveBitmap(context, processedBitmap)
-                    },
-                    onShare = {
-                        shareBitmap(context, processedBitmap)
-                    }
-                )
-            }
-        }
-        
-        // Panel de ajustes
-        if (showSettings) {
-            SettingsPanel(
-                settings = settings,
-                onSettingsChanged = { newSettings ->
-                    settings = newSettings
-                    if (originalBitmap != null) {
-                        isLoading = true
-                        processedBitmap = ImageProcessor.processImage(
-                            originalBitmap!!,
-                            selectedFilter,
-                            newSettings
-                        )
-                        isLoading = false
-                    }
-                },
-                onDismiss = { showSettings = false }
-            )
-        }
-    }
-}
-
-@Composable
-fun GalleryTab(
-    originalBitmap: Bitmap?,
-    processedBitmap: Bitmap?,
-    isLoading: Boolean,
-    onImageSelected: () -> Unit
-) {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        if (originalBitmap == null) {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(300.dp)
-                    .clickable { onImageSelected() },
-                shape = RoundedCornerShape(16.dp),
-                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(MaterialTheme.colorScheme.surface),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(
-                            Icons.Default.AddPhotoAlternate,
-                            contentDescription = "Seleccionar imagen",
-                            modifier = Modifier.size(64.dp),
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text(
-                            "Toca para seleccionar una imagen",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                }
-            }
-        } else {
-            ImagePreview(originalBitmap, processedBitmap, isLoading)
-        }
-    }
-}
-
-@Composable
-fun CameraTab(
-    originalBitmap: Bitmap?,
-    processedBitmap: Bitmap?,
-    onCapture: () -> Unit
-) {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        if (originalBitmap == null) {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(300.dp)
-                    .clickable { onCapture() },
-                shape = RoundedCornerShape(16.dp),
-                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(MaterialTheme.colorScheme.surface),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(
-                            Icons.Default.CameraAlt,
-                            contentDescription = "Tomar foto",
-                            modifier = Modifier.size(64.dp),
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text(
-                            "Toca para tomar una foto",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                }
-            }
-        } else {
-            ImagePreview(originalBitmap, processedBitmap, false)
-        }
-    }
-}
-
-@Composable
-fun HistoryTab() {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(300.dp),
-            shape = RoundedCornerShape(16.dp),
-            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(MaterialTheme.colorScheme.surface),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        Icons.Default.History,
-                        contentDescription = "Historial",
-                        modifier = Modifier.size(64.dp),
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text(
-                        "Historial de stencils",
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        "Próximamente",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                listOf("Galería" to Icons.Default.Image, "Cámara" to Icons.Default.CameraAlt, "Historial" to Icons.Default.History).forEachIndexed { i, pair ->
+                    NavigationBarItem(selected = tab == i, onClick = { tab = i }, icon = { Icon(pair.second, pair.first) }, label = { Text(pair.first) })
                 }
             }
         }
-    }
-}
+    ) { padding ->
+        Column(Modifier.fillMaxSize().padding(padding).padding(horizontal = 12.dp)) {
+            when (tab) {
+                0 -> SourcePanel("Importar referencia", Icons.Default.AddPhotoAlternate) { galleryLauncher.launch("image/*") }
+                1 -> SourcePanel("Tomar foto", Icons.Default.CameraAlt) {
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) pendingCamera = true
+                    else cameraPermission.launch(Manifest.permission.CAMERA)
+                }
+                2 -> HistoryPanel(history, onOpen = { uri ->
+                    scope.launch {
+                        val bmp = withContext(Dispatchers.IO) { context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) } }
+                        if (bmp != null) { original = bmp; result = bmp; tab = 0 } else toast(context, "No se pudo abrir este historial")
+                    }
+                }, onShare = { uri -> shareUri(context, uri) }, onDelete = { item -> history = deleteHistory(context, item); })
+            }
 
-@Composable
-fun ImagePreview(
-    originalBitmap: Bitmap?,
-    processedBitmap: Bitmap?,
-    isLoading: Boolean
-) {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        if (isLoading) {
-            CircularProgressIndicator(
-                modifier = Modifier.size(48.dp)
-            )
-        } else if (processedBitmap != null) {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(400.dp),
-                shape = RoundedCornerShape(16.dp),
-                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
-            ) {
-                Image(
-                    bitmap = processedBitmap.asImageBitmap(),
-                    contentDescription = "Stencil procesado",
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Fit
-                )
+            if (original != null && tab != 2) {
+                Spacer(Modifier.height(10.dp))
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Text("Vista", fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.weight(1f))
+                    Text(if (compareOriginal) "Original" else "Stencil")
+                    Switch(checked = compareOriginal, onCheckedChange = { compareOriginal = it })
+                }
+                PreviewCard(if (compareOriginal) original else result, loading)
+                Spacer(Modifier.height(10.dp))
+                FilterSelector(filter) { filter = it; process(original!!) }
+                Spacer(Modifier.height(10.dp))
+                OutlinedButton(onClick = { result?.let { saveBitmap(context, it)?.let { uri -> history = addHistory(context, uri) } } }, enabled = result != null, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Save, null); Spacer(Modifier.width(8.dp)); Text("Guardar stencil en Fotos") }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { result?.let { shareBitmap(context, it) } }, enabled = result != null, modifier = Modifier.weight(1f)) { Icon(Icons.Default.Share, null); Spacer(Modifier.width(4.dp)); Text("Compartir") }
+                    OutlinedButton(onClick = { original = null; result = null }, modifier = Modifier.weight(1f)) { Icon(Icons.Default.Delete, null); Spacer(Modifier.width(4.dp)); Text("Limpiar") }
+                }
+                Spacer(Modifier.height(12.dp))
             }
         }
+        if (showSettings) SettingsPanel(settings, { new -> settings = new; original?.let { process(it, filter, new) } }, { showSettings = false })
     }
 }
 
 @Composable
-fun FilterSelector(
-    selectedFilter: FilterType,
-    onFilterSelected: (FilterType) -> Unit
-) {
-    val filters = FilterType.values()
-    
-    Column {
-        Text(
-            "Seleccionar filtro",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        
-        LazyColumn(
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            items(filters) { filter ->
-                FilterCard(
-                    filter = filter,
-                    isSelected = filter == selectedFilter,
-                    onClick = { onFilterSelected(filter) }
-                )
+fun SourcePanel(title: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
+    Card(Modifier.fillMaxWidth().padding(top = 8.dp).clickable { onClick() }, shape = RoundedCornerShape(18.dp)) {
+        Column(Modifier.fillMaxWidth().padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(icon, null, Modifier.size(52.dp), tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.height(8.dp)); Text(title, fontWeight = FontWeight.Bold, fontSize = 18.sp); Text("JPG, PNG, WEBP • procesamiento local", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
+fun PreviewCard(bitmap: Bitmap?, loading: Boolean) {
+    Card(Modifier.fillMaxWidth().height(360.dp), shape = RoundedCornerShape(16.dp)) {
+        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface), contentAlignment = Alignment.Center) {
+            when { loading -> CircularProgressIndicator(); bitmap != null -> Image(bitmap.asImageBitmap(), "Vista previa", Modifier.fillMaxSize(), contentScale = ContentScale.Fit); else -> Text("Procesando…") }
+        }
+    }
+}
+
+@Composable
+fun FilterSelector(selected: FilterType, onSelected: (FilterType) -> Unit) {
+    LazyColumn(Modifier.fillMaxWidth().heightIn(max = 240.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        items(FilterType.values().toList()) { f ->
+            FilterChip(selected = selected == f, onClick = { onSelected(f) }, label = { Column { Text(f.displayName); Text(f.description, style = MaterialTheme.typography.labelSmall) } }, leadingIcon = { if (selected == f) Icon(Icons.Default.Check, null) })
+        }
+    }
+}
+
+@Composable
+fun HistoryPanel(items: List<HistoryItem>, onOpen: (Uri) -> Unit, onShare: (Uri) -> Unit, onDelete: (HistoryItem) -> Unit) {
+    Column(Modifier.fillMaxSize().padding(top = 8.dp)) {
+        Text("Historial", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        if (items.isEmpty()) Text("Los stencils guardados aparecerán aquí.", Modifier.padding(top = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 10.dp)) {
+            items(items, key = { it.uri }) { item ->
+                Card(Modifier.fillMaxWidth()) {
+                    Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Image, null, Modifier.size(38.dp)); Spacer(Modifier.width(10.dp)); Column(Modifier.weight(1f)) { Text(item.name, fontWeight = FontWeight.Bold); Text(SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault()).format(Date(item.date)), style = MaterialTheme.typography.labelSmall) }
+                        IconButton({ onOpen(Uri.parse(item.uri)) }) { Icon(Icons.Default.OpenInNew, "Abrir") }
+                        IconButton({ onShare(Uri.parse(item.uri)) }) { Icon(Icons.Default.Share, "Compartir") }
+                        IconButton({ onDelete(item) }) { Icon(Icons.Default.Delete, "Eliminar") }
+                    }
+                }
             }
-        }
-    }
-}
-
-@Composable
-fun FilterCard(
-    filter: FilterType,
-    isSelected: Boolean,
-    onClick: () -> Unit
-) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onClick() },
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = if (isSelected) 
-                MaterialTheme.colorScheme.primary 
-            else 
-                MaterialTheme.colorScheme.surface
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                when (filter) {
-                    FilterType.CANNY_EDGE -> Icons.Default.Brush
-                    FilterType.ADAPTIVE_THRESHOLD -> Icons.Default.Contrast
-                    FilterType.SKETCH -> Icons.Default.Edit
-                    FilterType.HIGH_CONTRAST -> Icons.Default.Tune
-                    FilterType.INVERT -> Icons.Default.InvertColors
-                    FilterType.CUSTOM -> Icons.Default.Settings
-                },
-                contentDescription = null,
-                tint = if (isSelected) 
-                    MaterialTheme.colorScheme.onPrimary 
-                else 
-                    MaterialTheme.colorScheme.primary
-            )
-            Spacer(modifier = Modifier.width(16.dp))
-            Text(
-                filter.displayName,
-                style = MaterialTheme.typography.bodyLarge,
-                color = if (isSelected) 
-                    MaterialTheme.colorScheme.onPrimary 
-                else 
-                    MaterialTheme.colorScheme.onSurface
-            )
-        }
-    }
-}
-
-@Composable
-fun ActionButtons(
-    processedBitmap: Bitmap?,
-    onReset: () -> Unit,
-    onSave: () -> Unit,
-    onShare: () -> Unit
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceEvenly
-    ) {
-        Button(
-            onClick = onReset,
-            colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.error
-            )
-        ) {
-            Icon(Icons.Default.Delete, contentDescription = null)
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Resetear")
-        }
-        
-        Button(
-            onClick = onSave,
-            enabled = processedBitmap != null
-        ) {
-            Icon(Icons.Default.Save, contentDescription = null)
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Guardar")
-        }
-        
-        Button(
-            onClick = onShare,
-            enabled = processedBitmap != null
-        ) {
-            Icon(Icons.Default.Share, contentDescription = null)
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Compartir")
         }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsPanel(
-    settings: ProcessingSettings,
-    onSettingsChanged: (ProcessingSettings) -> Unit,
-    onDismiss: () -> Unit
-) {
+fun SettingsPanel(settings: ProcessingSettings, onChange: (ProcessingSettings) -> Unit, onDismiss: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp)
-        ) {
-            Text(
-                "Ajustes de Procesamiento",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold
-            )
-            Spacer(modifier = Modifier.height(24.dp))
-            
-            SettingsSlider(
-                label = "Brillo",
-                value = settings.brightness,
-                onValueChange = { newValue ->
-                    onSettingsChanged(settings.copy(brightness = newValue))
-                },
-                valueRange = -100f..100f
-            )
-            
-            Spacer(modifier = Modifier.height(16.dp))
-            
-            SettingsSlider(
-                label = "Contraste",
-                value = settings.contrast,
-                onValueChange = { newValue ->
-                    onSettingsChanged(settings.copy(contrast = newValue))
-                },
-                valueRange = 0f..2f
-            )
-            
-            Spacer(modifier = Modifier.height(16.dp))
-            
-            SettingsSlider(
-                label = "Umbral",
-                value = settings.threshold.toFloat(),
-                onValueChange = { newValue ->
-                    onSettingsChanged(settings.copy(threshold = newValue.toInt()))
-                },
-                valueRange = 0f..255f
-            )
-            
-            Spacer(modifier = Modifier.height(16.dp))
-            
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Invertir colores")
-                Switch(
-                    checked = settings.invertColors,
-                    onCheckedChange = { newValue ->
-                        onSettingsChanged(settings.copy(invertColors = newValue))
-                    }
-                )
-            }
-            
-            Spacer(modifier = Modifier.height(16.dp))
-            
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Suavizar bordes")
-                Switch(
-                    checked = settings.smoothEdges,
-                    onCheckedChange = { newValue ->
-                        onSettingsChanged(settings.copy(smoothEdges = newValue))
-                    }
-                )
-            }
+        LazyColumn(Modifier.fillMaxWidth().padding(horizontal = 18.dp).padding(bottom = 28.dp)) {
+            item { Text("Ajustes de stencil", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Text("Los cambios se aplican automáticamente.", color = MaterialTheme.colorScheme.onSurfaceVariant); Spacer(Modifier.height(14.dp)) }
+            item { SettingSlider("Brillo", settings.brightness, -80f..80f, "%.0f") { onChange(settings.copy(brightness = it)) } }
+            item { SettingSlider("Contraste", settings.contrast, 0.7f..2.0f, "%.2f") { onChange(settings.copy(contrast = it)) } }
+            item { SettingSlider("Sensibilidad de línea", settings.edgeStrength.toFloat(), 10f..90f, "%.0f") { onChange(settings.copy(edgeStrength = it.toInt())) } }
+            item { SettingSlider("Umbral", settings.threshold.toFloat(), 5f..220f, "%.0f") { onChange(settings.copy(threshold = it.toInt())) } }
+            item { SettingSlider("Grosor", settings.lineWidth.toFloat(), 1f..3f, "%.0f") { onChange(settings.copy(lineWidth = it.toInt())) } }
+            item { SwitchRow("Suavizar bordes", settings.smoothEdges) { onChange(settings.copy(smoothEdges = it)) } }
+            item { SwitchRow("Eliminar puntos aislados", settings.removeNoise) { onChange(settings.copy(removeNoise = it)) } }
+            item { SwitchRow("Preservar detalle", settings.preserveDetail) { onChange(settings.copy(preserveDetail = it)) } }
+            item { SwitchRow("Fondo blanco", settings.backgroundWhite) { onChange(settings.copy(backgroundWhite = it)) } }
+            item { SwitchRow("Invertir", settings.invertColors) { onChange(settings.copy(invertColors = it)) } }
+            item { Text("Color de línea", Modifier.padding(top = 12.dp), fontWeight = FontWeight.Bold) }
+            item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) { LineColor.values().forEach { c -> FilterChip(selected = settings.lineColor == c, onClick = { onChange(settings.copy(lineColor = c)) }, label = { Text(c.displayName) }) } } }
+            item { Spacer(Modifier.height(14.dp)); Button(onClick = { onChange(ProcessingSettings()); }, modifier = Modifier.fillMaxWidth()) { Text("Restaurar ajustes") } }
         }
     }
 }
 
 @Composable
-fun SettingsSlider(
-    label: String,
-    value: Float,
-    onValueChange: (Float) -> Unit,
-    valueRange: ClosedFloatingPointRange<Float>
-) {
-    Column {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(label, style = MaterialTheme.typography.bodyLarge)
-            Text(
-                String.format("%.1f", value),
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.Bold
-            )
-        }
-        Slider(
-            value = value,
-            onValueChange = onValueChange,
-            valueRange = valueRange,
-            modifier = Modifier.fillMaxWidth()
-        )
-    }
+fun SettingSlider(label: String, value: Float, range: ClosedFloatingPointRange<Float>, format: String, onChange: (Float) -> Unit) {
+    Column(Modifier.padding(vertical = 6.dp)) { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text(label); Text(String.format(Locale.US, format, value), fontWeight = FontWeight.Bold) }; Slider(value, onValueChange = onChange, valueRange = range) }
 }
 
-// Función para guardar bitmap
-fun saveBitmap(context: android.content.Context, bitmap: Bitmap?) {
-    bitmap?.let {
-        try {
-            val filename = "stencil_${System.currentTimeMillis()}.png"
-            val file = File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), filename)
-            FileOutputStream(file).use { out ->
-                it.compress(Bitmap.CompressFormat.PNG, 100, out)
-            }
-            Toast.makeText(context, "Guardado en: ${file.absolutePath}", Toast.LENGTH_LONG).show()
-        } catch (e: Exception) {
-            Toast.makeText(context, "Error al guardar", Toast.LENGTH_SHORT).show()
-        }
-    }
+@Composable
+fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) { Row(Modifier.fillMaxWidth().padding(vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) { Text(label, Modifier.weight(1f)); Switch(checked, onCheckedChange = onChange) } }
+
+fun toast(context: Context, text: String) = Toast.makeText(context, text, Toast.LENGTH_SHORT).show()
+
+fun saveBitmap(context: Context, bitmap: Bitmap): Uri? {
+    val name = "StencilPro_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.png"
+    return try {
+        val resolver = context.contentResolver
+        val values = ContentValues().apply { put(MediaStore.Images.Media.DISPLAY_NAME, name); put(MediaStore.Images.Media.MIME_TYPE, "image/png"); if (Build.VERSION.SDK_INT >= 29) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/StencilPro"); if (Build.VERSION.SDK_INT >= 29) put(MediaStore.Images.Media.IS_PENDING, 1) }
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+        resolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        if (Build.VERSION.SDK_INT >= 29) resolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
+        toast(context, "Stencil guardado en Fotos/StencilPro"); uri
+    } catch (e: Exception) { toast(context, "No se pudo guardar: ${e.message}"); null }
 }
 
-// Función para compartir bitmap
-fun shareBitmap(context: android.content.Context, bitmap: Bitmap?) {
-    bitmap?.let {
-        try {
-            val filename = "stencil_${System.currentTimeMillis()}.png"
-            val file = File(context.cacheDir, filename)
-            FileOutputStream(file).use { out ->
-                it.compress(Bitmap.CompressFormat.PNG, 100, out)
-            }
-            
-            val uri = androidx.core.content.FileProvider.getUriForFile(
-                context,
-                "${context.packageName}.fileprovider",
-                file
-            )
-            
-            val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                type = "image/png"
-                putExtra(Intent.EXTRA_STREAM, uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            
-            context.startActivity(Intent.createChooser(shareIntent, "Compartir stencil"))
-        } catch (e: Exception) {
-            Toast.makeText(context, "Error al compartir", Toast.LENGTH_SHORT).show()
-        }
-    }
+fun shareBitmap(context: Context, bitmap: Bitmap) {
+    val file = File(context.cacheDir, "stencil_share_${System.currentTimeMillis()}.png")
+    try {
+        FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        shareUri(context, FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file))
+    } catch (e: Exception) { toast(context, "No se pudo compartir") }
+}
+
+fun shareUri(context: Context, uri: Uri) {
+    context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { type = "image/*"; putExtra(Intent.EXTRA_STREAM, uri); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }, "Compartir stencil"))
+}
+
+private fun loadHistory(context: Context): List<HistoryItem> {
+    val prefs = context.getSharedPreferences("history", Context.MODE_PRIVATE)
+    return prefs.getStringSet("items", emptySet()).orEmpty().mapNotNull { raw ->
+        val p = raw.split("|", limit = 3); if (p.size == 3) HistoryItem(p[0], p[1], p[2].toLongOrNull() ?: 0) else null
+    }.sortedByDescending { it.date }
+}
+
+private fun persistHistory(context: Context, items: List<HistoryItem>) {
+    context.getSharedPreferences("history", Context.MODE_PRIVATE).edit().putStringSet("items", items.take(30).map { "${it.uri}|${it.name}|${it.date}" }.toSet()).apply()
+}
+
+private fun addHistory(context: Context, uri: Uri): List<HistoryItem> {
+    val items = loadHistory(context).filter { it.uri != uri.toString() }.toMutableList()
+    items.add(0, HistoryItem(uri.toString(), "Stencil ${items.size + 1}", System.currentTimeMillis()))
+    persistHistory(context, items); return items
+}
+
+private fun deleteHistory(context: Context, item: HistoryItem): List<HistoryItem> {
+    runCatching { context.contentResolver.delete(Uri.parse(item.uri), null, null) }
+    val items = loadHistory(context).filterNot { it.uri == item.uri }; persistHistory(context, items); return items
 }
