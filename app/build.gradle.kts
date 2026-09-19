@@ -72,6 +72,9 @@ dependencies {
     
     // Coil (carga de imágenes)
     implementation("io.coil-kt:coil-compose:2.5.0")
+
+    // Local neural line-art inference
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
     
     // Testing
     testImplementation(libs.junit)

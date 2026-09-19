@@ -69,7 +69,7 @@ fun StencilProApp() {
     val scope = rememberCoroutineScope()
     var original by remember { mutableStateOf<Bitmap?>(null) }
     var result by remember { mutableStateOf<Bitmap?>(null) }
-    var filter by remember { mutableStateOf(FilterType.CLEAN_LINES) }
+    var filter by remember { mutableStateOf(FilterType.AI_STENCIL) }
     var settings by remember { mutableStateOf(ProcessingSettings()) }
     var tab by remember { mutableStateOf(0) }
     var loading by remember { mutableStateOf(false) }
@@ -82,7 +82,7 @@ fun StencilProApp() {
         processingJob?.cancel()
         loading = true
         processingJob = scope.launch {
-            val processed = withContext(Dispatchers.Default) { ImageProcessor.processImage(source, f, s) }
+            val processed = ImageProcessor.processImage(context, source, f, s)
             result = processed
             loading = false
         }
@@ -196,7 +196,7 @@ fun StencilProApp() {
                 Spacer(Modifier.height(12.dp))
                 Text("Tipo de plantilla", fontWeight = FontWeight.Bold)
                 Text(
-                    if (filter == FilterType.CLEAN_LINES) "Modo profesional: líneas estructurales limpias, sin textura fotográfica." else filter.description,
+                    if (filter == FilterType.AI_STENCIL) "Motor IA local: extracción de lineart + reconstrucción y limpieza de stencil." else if (filter == FilterType.CLEAN_LINES) "Líneas estructurales limpias, sin textura fotográfica." else filter.description,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(top = 3.dp, bottom = 6.dp)
@@ -266,6 +266,9 @@ fun SettingsPanel(settings: ProcessingSettings, onChange: (ProcessingSettings) -
             item { SettingSlider("Brillo", settings.brightness, -80f..80f, "%.0f") { onChange(settings.copy(brightness = it)) } }
             item { SettingSlider("Contraste", settings.contrast, 0.7f..2.0f, "%.2f") { onChange(settings.copy(contrast = it)) } }
             item { SettingSlider("Sensibilidad de línea", settings.edgeStrength.toFloat(), 10f..90f, "%.0f") { onChange(settings.copy(edgeStrength = it.toInt())) } }
+            item { SettingSlider("Detalle IA", settings.aiDetail.toFloat(), 20f..100f, "%.0f") { onChange(settings.copy(aiDetail = it.toInt())) } }
+            item { SettingSlider("Limpieza IA", settings.aiCleanup.toFloat(), 20f..100f, "%.0f") { onChange(settings.copy(aiCleanup = it.toInt())) } }
+            item { Text("El modo IA descarga los modelos una sola vez y procesa localmente.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             item { SettingSlider("Umbral", settings.threshold.toFloat(), 5f..220f, "%.0f") { onChange(settings.copy(threshold = it.toInt())) } }
             item { SettingSlider("Grosor", settings.lineWidth.toFloat(), 1f..3f, "%.0f") { onChange(settings.copy(lineWidth = it.toInt())) } }
             item { SwitchRow("Suavizar bordes", settings.smoothEdges) { onChange(settings.copy(smoothEdges = it)) } }
