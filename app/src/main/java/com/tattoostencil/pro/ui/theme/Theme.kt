@@ -61,3 +61,4 @@ fun StencilProTheme(
         typography = Typography,
         content = content
     )
+}
